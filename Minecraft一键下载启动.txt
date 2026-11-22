@@ -1,0 +1,627 @@
+@echo off
+chcp 65001 >nul 2>nul
+setlocal EnableExtensions EnableDelayedExpansion
+title Minecraft Java Edition 一键下载与启动
+color 0A
+
+REM ======================================================================
+REM  Minecraft Java Edition —— 一键下载 + 启动（纯 cmd 命令脚本）
+REM
+REM  功能对应要求：
+REM    1. 先检查本机是否安装了 Java；没有安装就自动安装 OpenJDK 27
+REM       （便携版，解压到游戏目录下的 java 文件夹，不改系统环境变量）
+REM    2. 下载优先使用国内高速镜像（BMCLAPI、清华镜像、GitHub 加速站），
+REM       镜像拿不到时自动回退 Mojang 官方源
+REM    3. 再次启动已经下载过的版本时跳过下载，直接启动游戏
+REM    4. 登录账号：默认离线账号（用户名在下面配置区修改），
+REM       把 LOGIN 改成 msa 就能用正版微软账号登录
+REM    5. 可选安装 Fabric 模组加载器：把 MOD_LOADER 改成 fabric 即可，
+REM       装完把 mod 的 jar 放进 MC\game\mods 就能玩（不支持 Forge/NeoForge）
+REM
+REM  使用方法：
+REM    把本 txt 文件复制一份，重命名为  Minecraft.bat  ，双击运行即可；
+REM    游戏文件会安装到本文件所在目录下的 MC 文件夹中。
+REM    推荐 Windows 10 1803 及以上（自带 curl.exe / tar.exe），
+REM    游戏版本建议填 1.13 及以上的正式版，留空则自动用最新正式版。
+REM
+REM  说明：下载、解压、启动全部用 cmd 的 curl / tar / java 命令完成，
+REM        只有解析 Mojang 的 JSON 文件时借用系统自带的 powershell，
+REM        不需要安装任何第三方启动器。
+REM  提示：游戏窗口旁边那个黑框会滚动 XML 格式日志，这是 Minecraft 自带的
+REM        日志格式，属正常现象；启动失败请看 logs\latest.log 里的报错。
+REM ======================================================================
+
+REM ============================== 配置区 ==============================
+REM  游戏版本：留空 = 自动使用最新正式版；也可以填 1.21.4 或 1.20.1 等
+set "MC_VERSION="
+REM  离线登录用户名：3-16 位字母、数字或下划线，不要用中文和空格
+set "PLAYER_NAME=Steve"
+REM  分配给游戏的最大内存，例如 2G / 4G / 8G
+set "MEMORY=4G"
+REM  1 = 优先国内镜像（推荐）   0 = 只使用官方源
+set "USE_MIRROR=1"
+REM  本机没有 Java 时要安装的 OpenJDK 主版本号
+set "JAVA_MAJOR=27"
+REM  模组加载器：留空 = 纯原版；填 fabric = 安装 Fabric（mod 放 MC\game\mods）
+set "MOD_LOADER="
+REM  Fabric 加载器版本：留空 = 自动选该游戏版本的最新稳定版
+set "FABRIC_LOADER="
+REM  登录方式：offline = 离线账号（用上面的 PLAYER_NAME，默认）
+REM            msa     = 正版微软账号（首次要在网页上输一次代码，令牌会缓存复用）
+set "LOGIN=offline"
+REM ====================================================================
+
+REM ---------------------- 内部变量，一般不用改 ----------------------
+set "BASE=%~dp0MC"
+set "D_TMP=tmp"
+set "D_JAVA=java"
+set "D_VER=versions"
+set "D_LIB=libraries"
+set "D_AST=assets"
+set "D_NAT=natives"
+set "D_GAME=game"
+set "PS=powershell -NoProfile -ExecutionPolicy Bypass -Command"
+set "BMCL=https://bmclapi2.bangbang93.com"
+
+cls
+echo ======================================================================
+echo    Minecraft Java Edition  一键下载与启动
+echo ----------------------------------------------------------------------
+echo    游戏目录 : %BASE%
+echo    离线账号 : %PLAYER_NAME%
+echo ======================================================================
+echo.
+
+REM ---------------------- 运行环境自检 ----------------------
+where curl >nul 2>nul
+if errorlevel 1 (
+    echo [错误] 没有找到 curl.exe，请升级到 Windows 10 1803 及以上版本。
+    goto :FATAL
+)
+echo %BASE% | findstr /c:"'" >nul
+if not errorlevel 1 (
+    echo [错误] 文件夹路径里不能有单引号，请把本文件放到别的目录再运行。
+    goto :FATAL
+)
+if not exist "%BASE%" md "%BASE%" >nul 2>nul
+pushd "%BASE%"
+if errorlevel 1 (
+    echo [错误] 无法进入目录 %BASE%
+    goto :FATAL
+)
+for %%d in (%D_TMP% %D_JAVA% %D_VER% %D_LIB% %D_AST% %D_NAT% %D_GAME%) do if not exist "%%d" md "%%d" >nul 2>nul
+for %%d in (%D_NAT%\java %D_NAT%\jna %D_NAT%\lwjgl %D_NAT%\netty) do if not exist "%%d" md "%%d" >nul 2>nul
+
+set "CURL_PAR="
+curl.exe --help all 2>nul | findstr /c:"--parallel-max" >nul
+if not errorlevel 1 set "CURL_PAR=1"
+
+REM ============================ 1. Java =============================
+call :HEAD "1/7 检查 Java 运行环境"
+call :ENSURE_JAVA
+if errorlevel 1 goto :FATAL
+
+REM ========================= 2. 版本清单 ============================
+call :HEAD "2/7 获取 Minecraft 版本清单"
+call :GET_VERSION
+if errorlevel 1 goto :FATAL
+
+REM ========================= 3. 解析版本 ============================
+call :HEAD "3/7 解析版本文件与下载清单"
+call :MAKE_PLAN
+if errorlevel 1 goto :FATAL
+set "MARK=%D_VER%\!VER!\.ok"
+if /i "%MOD_LOADER%"=="fabric" (
+    call :HEAD "3.5/7 准备 Fabric 加载器"
+    call :SETUP_FABRIC
+    if errorlevel 1 goto :FATAL
+    set "MARK=%D_VER%\!VER!\.ok-fabric-!FAB_VER!"
+)
+
+REM ========================= 4. Java 需求 ===========================
+call :HEAD "4/7 检查 Java 版本是否满足该游戏版本"
+call :CHECK_JAVA_REQ
+if errorlevel 1 goto :FATAL
+
+REM ========================= 4.5 登录账号 ==========================
+if /i "%LOGIN%"=="msa" (
+    call :HEAD "4.5/7 正版微软账号登录"
+    call :MSA_LOGIN
+    if errorlevel 1 goto :FATAL
+)
+
+REM ========================= 5/6. 下载文件 ==========================
+if exist "!MARK!" (
+    echo [跳过] 版本 !VER! 之前已经下载完成，本次直接启动。
+) else (
+    call :HEAD "5/7 下载游戏核心文件（依赖库 + 客户端）"
+    call :DOWNLOAD_FILES
+    if errorlevel 1 goto :FATAL
+    call :EXTRACT_NATIVES
+    call :HEAD "6/7 下载游戏资源文件（贴图 + 音效 + 语言）"
+    call :DOWNLOAD_ASSETS
+    if errorlevel 1 goto :FATAL
+    > "!MARK!" echo ok
+)
+
+REM ============================ 7. 启动 =============================
+call :HEAD "7/7 生成启动参数并启动游戏"
+call :MAKE_ARGS
+if errorlevel 1 goto :FATAL
+echo.
+echo    正在启动 Minecraft !VER! ，请稍候……
+echo    关闭游戏窗口后本窗口才会结束。
+echo.
+"%JAVA%" @"%D_TMP%\args.txt"
+echo.
+echo 游戏已退出。如果启动失败，可以查看日志：logs\latest.log
+popd
+pause
+exit /b 0
+
+
+REM ======================================================================
+REM  以下为子过程
+REM ======================================================================
+
+:HEAD
+echo.
+echo ---------- %~1 ----------
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  检查 / 安装 Java
+REM ----------------------------------------------------------------------
+:ENSURE_JAVA
+set "JAVA="
+set "JM="
+if exist "%D_JAVA%\bin\java.exe" (
+    set "JAVA=%CD%\%D_JAVA%\bin\java.exe"
+    call :JAVA_MAJOR "!JAVA!" JM
+    echo [OK] 使用内置 OpenJDK !JM! 路径 %D_JAVA%\bin\java.exe
+    exit /b 0
+)
+for /f "delims=" %%i in ('where java 2^>nul') do if not defined JAVA set "JAVA=%%i"
+if defined JAVA (
+    call :JAVA_MAJOR "!JAVA!" JM
+    if not defined JM set "JAVA="
+)
+if defined JAVA (
+    echo [OK] 系统已安装 Java !JM! 路径 !JAVA!
+    exit /b 0
+)
+echo [注意] 本机没有检测到 Java，开始安装 OpenJDK %JAVA_MAJOR% ...
+call :INSTALL_JDK %JAVA_MAJOR%
+if errorlevel 1 exit /b 1
+set "JAVA=%CD%\%D_JAVA%\bin\java.exe"
+call :JAVA_MAJOR "!JAVA!" JM
+echo [OK] OpenJDK !JM! 安装完成 路径 %D_JAVA%\bin\java.exe
+exit /b 0
+
+
+:JAVA_MAJOR
+REM  %1 = java.exe 路径    %2 = 回传主版本号的变量名
+set "%~2="
+"%~1" -version >"%D_TMP%\javaver.txt" 2>&1
+if errorlevel 1 exit /b 0
+set "JV="
+for /f "tokens=3" %%v in ('findstr /i /c:"version" "%D_TMP%\javaver.txt"') do if not defined JV set "JV=%%~v"
+if not defined JV exit /b 0
+set "MJ="
+for /f "tokens=1 delims=." %%a in ("!JV!") do set "MJ=%%a"
+if "!MJ!"=="1" for /f "tokens=2 delims=." %%b in ("!JV!") do set "MJ=%%b"
+if defined MJ set "%~2=!MJ!"
+exit /b 0
+
+
+:INSTALL_JDK
+REM  %1 = 需要安装的 OpenJDK 主版本号
+set "NEEDED=%~1"
+echo    正在查询 OpenJDK %NEEDED% 的下载地址 ...
+set "PKG="
+set "GHLINK="
+set "JKDSZ="
+del /q "%D_TMP%\jdkurl.txt" >nul 2>nul
+%PS% "$ErrorActionPreference='Stop'; $r=Invoke-RestMethod -UseBasicParsing -Uri ('https://api.adoptium.net/v3/assets/latest/%NEEDED%/hotspot?os=windows&architecture=x64&image_type=jdk'); $p=$r[0].binary.package; [IO.File]::WriteAllText('%D_TMP%\jdkurl.txt', ($p.name+'|'+$p.link+'|'+$p.size))" >nul 2>nul
+if exist "%D_TMP%\jdkurl.txt" for /f "usebackq tokens=1-3 delims=|" %%a in ("%D_TMP%\jdkurl.txt") do (
+    set "PKG=%%a"
+    set "GHLINK=%%b"
+    set "JKDSZ=%%c"
+)
+set "U1="
+set "U2="
+set "U3="
+set "U4="
+set "U5="
+if defined PKG (
+    set "U1=https://mirrors.tuna.tsinghua.edu.cn/Adoptium/%NEEDED%/jdk/x64/windows/!PKG!"
+    set "U2=https://mirrors.huaweicloud.com/adoptium/%NEEDED%/jdk/x64/windows/!PKG!"
+)
+if defined GHLINK (
+    set "U3=https://ghfast.top/!GHLINK!"
+    set "U4=https://gh-proxy.com/!GHLINK!"
+    set "U5=https://ghproxy.net/!GHLINK!"
+)
+set "DL_OUT=%D_TMP%\jdk.zip"
+set "DL_EXP=!JKDSZ!"
+set "DL_MIN=0"
+set "DL_ZIP=1"
+if not defined JKDSZ set "DL_EXP=0"
+if not defined JKDSZ set "DL_MIN=50000000"
+set "DL_URLS=!U1!;!U2!;!U3!;!U4!;!U5!;https://api.adoptium.net/v3/binary/latest/%NEEDED%/ga/windows/x64/jdk/hotspot/normal/eclipse"
+if "%USE_MIRROR%"=="0" set "DL_URLS=https://api.adoptium.net/v3/binary/latest/%NEEDED%/ga/windows/x64/jdk/hotspot/normal/eclipse"
+echo    开始下载 OpenJDK %NEEDED%，约 140 MB，请耐心等待 ...
+call :DL
+if errorlevel 1 (
+    echo [错误] OpenJDK 下载失败，请检查网络后重新运行。
+    exit /b 1
+)
+echo    正在解压 OpenJDK ...
+if exist "%D_TMP%\jdkx" rd /s /q "%D_TMP%\jdkx" >nul 2>nul
+md "%D_TMP%\jdkx" >nul 2>nul
+set "JDKDIR="
+tar -xf "%D_TMP%\jdk.zip" -C "%D_TMP%\jdkx" >nul 2>nul
+for /d %%d in ("%D_TMP%\jdkx\*") do if exist "%%~d\bin\java.exe" if not defined JDKDIR set "JDKDIR=%%~d"
+if not defined JDKDIR (
+    %PS% "Expand-Archive -Force -Path '%D_TMP%\jdk.zip' -DestinationPath '%D_TMP%\jdkx'" >nul 2>nul
+    for /d %%d in ("%D_TMP%\jdkx\*") do if exist "%%~d\bin\java.exe" if not defined JDKDIR set "JDKDIR=%%~d"
+)
+if not defined JDKDIR (
+    echo [错误] OpenJDK 解压后找不到 bin\java.exe，安装失败，请重新运行一次。
+    exit /b 1
+)
+if exist "%D_JAVA%" rd /s /q "%D_JAVA%" >nul 2>nul
+move "!JDKDIR!" "%D_JAVA%" >nul 2>nul
+if not exist "%D_JAVA%\bin\java.exe" (
+    echo [错误] OpenJDK 移动到 %D_JAVA% 目录失败，请重新运行一次。
+    exit /b 1
+)
+"%D_JAVA%\bin\java.exe" -version >nul 2>&1
+if errorlevel 1 (
+    echo [错误] 安装好的 java.exe 无法运行，请重新运行一次。
+    exit /b 1
+)
+del /q "%D_TMP%\jdk.zip" >nul 2>nul
+rd /s /q "%D_TMP%\jdkx" >nul 2>nul
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  获取版本清单、确定要启动的版本
+REM ----------------------------------------------------------------------
+:GET_VERSION
+set "VER="
+set "MANIFEST=%D_TMP%\version_manifest_v2.json"
+if not exist "%MANIFEST%" (
+    set "DL_OUT=%D_TMP%\version_manifest_v2.json"
+    set "DL_EXP=0"
+    set "DL_MIN=100000"
+    set "DL_ZIP=0"
+    set "DL_URLS=%BMCL%/mc/game/version_manifest_v2.json;https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+    if "%USE_MIRROR%"=="0" set "DL_URLS=https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+    call :DL
+)
+if not exist "%MANIFEST%" (
+    echo [错误] 无法获取 Minecraft 版本清单，请检查网络。
+    exit /b 1
+)
+if not "%MC_VERSION%"=="" (
+    set "VER=%MC_VERSION%"
+) else (
+    %PS% "(Get-Content -Raw '%MANIFEST%' | ConvertFrom-Json).latest.release" >"%D_TMP%\latest.txt" 2>nul
+    set /p VER=<"%D_TMP%\latest.txt"
+    if "!VER!"=="" (
+        echo [错误] 无法解析最新版本号。
+        exit /b 1
+    )
+)
+echo    目标游戏版本 !VER!
+if not exist "%D_VER%\!VER!" md "%D_VER%\!VER!" >nul 2>nul
+set "VJSON=%D_VER%\!VER!\!VER!.json"
+if not exist "!VJSON!" (
+    echo    下载版本文件 !VER!.json ...
+    set "VURL="
+    del /q "%D_TMP%\vurl.txt" >nul 2>nul
+    %PS% "$m=Get-Content -Raw '%MANIFEST%' | ConvertFrom-Json; $u=($m.versions | Where-Object { $_.id -eq '!VER!' } | Select-Object -First 1); if($u){$u.url}" >"%D_TMP%\vurl.txt" 2>nul
+    if exist "%D_TMP%\vurl.txt" set /p VURL=<"%D_TMP%\vurl.txt"
+    set "DL_OUT=!VJSON!"
+    set "DL_EXP=0"
+    set "DL_MIN=1000"
+    set "DL_ZIP=0"
+    set "DL_URLS=%BMCL%/version/!VER!/json"
+    if defined VURL set "DL_URLS=!DL_URLS!;!VURL!"
+    call :DL
+    if not exist "!VJSON!" (
+        echo [错误] 版本 !VER! 不存在或下载失败，请检查版本号是否填写正确。
+        exit /b 1
+    )
+)
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  解析版本文件，生成库文件清单、classpath、Java 需求版本
+REM ----------------------------------------------------------------------
+:MAKE_PLAN
+echo    正在解析库文件与资源索引 ...
+%PS% "$j=Get-Content -Raw '%D_VER%\!VER!\!VER!.json' | ConvertFrom-Json; function OK($r){ if(-not $r){return $true}; $res=$false; foreach($x in $r){ $mt=$true; if($x.os){ if($x.os.name -and $x.os.name -ne 'windows'){$mt=$false}; if($x.os.arch -and $x.os.arch -notin @('x64','amd64')){$mt=$false} }; if($x.features){ foreach($p in $x.features.PSObject.Properties){ if($p.Value){$mt=$false} } }; if($mt){ if($x.action -eq 'allow'){$res=$true} else {$res=$false} } }; $res }; function MU($u){ $u -replace '^https://libraries\.minecraft\.net/','https://bmclapi2.bangbang93.com/maven/' }; $cp=@(); $f=@(); $n=@(); foreach($l in $j.libraries){ if(-not (OK $l.rules)){continue}; if($l.name -like '*natives-windows-arm64'){continue}; if($l.name -like '*natives-windows-x86'){continue}; $a=$l.downloads.artifact; if($a){ $p='%D_LIB%\'+$a.path; $cp+=$p; $f+=($p+'|'+(MU $a.url)+'|'+$a.url+'|'+$a.size) }; $c=$l.downloads.classifiers; if($c){ $k=$c.PSObject.Properties | Where-Object { $_.Name -like 'natives-windows*' } | Select-Object -First 1; if($k){ $b=$k.Value; $p='%D_LIB%\'+$b.path; $n+=($p+'|'+(MU $b.url)+'|'+$b.url+'|'+$b.size); $f+=($p+'|'+(MU $b.url)+'|'+$b.url+'|'+$b.size) } } }; if($j.downloads.client){ $p='%D_VER%\'+$j.id+'\'+$j.id+'.jar'; $cp+=$p; $f+=($p+'|https://bmclapi2.bangbang93.com/version/'+$j.id+'/client|'+$j.downloads.client.url+'|'+$j.downloads.client.size) }; if($j.assetIndex){ $p='%D_AST%\indexes\'+$j.assetIndex.id+'.json'; $f+=($p+'|https://bmclapi2.bangbang93.com/v1/packages/'+$j.assetIndex.sha1+'/'+$j.assetIndex.id+'.json|'+$j.assetIndex.url+'|'+$j.assetIndex.size) }; if($j.logging.client){ $lg=$j.logging.client.file; $p='%D_VER%\'+$j.id+'\'+$lg.id; $f+=($p+'|'+$lg.url+'|'+$lg.url+'|'+$lg.size) }; [IO.File]::WriteAllLines('%D_TMP%\files.txt',[string[]]@($f)); [IO.File]::WriteAllLines('%D_TMP%\natives.txt',[string[]]@($n)); [IO.File]::WriteAllText('%D_TMP%\classpath.txt',($cp -join ';')); if($j.javaVersion){ [IO.File]::WriteAllText('%D_TMP%\javamaj.txt',[string]$j.javaVersion.majorVersion) } else { [IO.File]::WriteAllText('%D_TMP%\javamaj.txt','21') }" >nul 2>"%D_TMP%\plan.err"
+if not exist "%D_TMP%\files.txt" (
+    echo [错误] 解析版本文件失败，文件可能已损坏。
+    if exist "%D_TMP%\plan.err" type "%D_TMP%\plan.err"
+    exit /b 1
+)
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  准备 Fabric 加载器（profile 取自 fabric-meta，库文件走 BMCLAPI 镜像）
+REM ----------------------------------------------------------------------
+:SETUP_FABRIC
+if not exist "%D_GAME%\mods" md "%D_GAME%\mods" >nul 2>nul
+del /q "%D_TMP%\fabric_ok.txt" >nul 2>nul
+echo    正在查询 Fabric 加载器版本 ...
+%PS% "$ErrorActionPreference='Stop'; $v='!VER!'; $lv='%FABRIC_LOADER%'; $mk='https://bmclapi2.bangbang93.com/fabric-meta'; $og='https://meta.fabricmc.net'; $cache='%D_TMP%\fabric_profile.json'; $raw=$null; foreach($b in @($mk,$og)){ try { if($lv -eq ''){ $r=Invoke-RestMethod -UseBasicParsing ($b+'/v2/versions/loader/'+$v); $s=@($r | Where-Object { $_.loader.stable }); if($s.Count -gt 0){ $lv=$s[0].loader.version } else { $lv=@($r)[0].loader.version } }; $w=Invoke-WebRequest -UseBasicParsing ($b+'/v2/versions/loader/'+$v+'/'+$lv+'/profile/json'); $raw=$w.Content; break } catch { $lv='%FABRIC_LOADER%' } }; if($raw){ [IO.File]::WriteAllText($cache,$raw) } elseif(Test-Path $cache){ $raw=Get-Content -Raw $cache; Write-Host '    [提示] 连不上 Fabric 服务器，使用本地缓存的加载器配置' } else { Write-Host '[错误] 无法获取 Fabric 加载器配置'; exit 2 }; $p=$raw | ConvertFrom-Json; $dlv=($p.id -replace '^fabric-loader-','') -replace ('-'+[regex]::Escape($v)+'$'),''; if($dlv){ $lv=$dlv }; $fl=@(); $fl+=('LOADER='+$lv); $fl+=('MAINCLASS='+$p.mainClass); foreach($a in @($p.arguments.jvm)){ if($a){ $fl+=('JVMA='+$a) } }; $files=@(); $libs=@(); $ids=@(); foreach($l in @($p.libraries)){ $n=[string]$l.name; $q=$n -split ':'; if($q.Count -lt 3){ continue }; $rel=($q[0] -replace '\.','/')+'/'+$q[1]+'/'+$q[2]+'/'+$q[1]+'-'+$q[2]; if($q.Count -gt 3){ $rel=$rel+'-'+$q[3] }; $rel=$rel+'.jar'; $dst='%D_LIB%\'+($rel -replace '/','\'); $libs+=$dst; $sg=$rel -split '/'; $ids+=(($sg[0..($sg.Count-3)]) -join '/'); $repo='https://maven.fabricmc.net/'; if($l.url){ $repo=[string]$l.url }; if(-not $repo.EndsWith('/')){ $repo=$repo+'/' }; $files+=($dst+'|https://bmclapi2.bangbang93.com/maven/'+$rel+'|'+$repo+$rel); $fl+=('LIB='+$n) }; [IO.File]::WriteAllText('%D_TMP%\fabric.txt', ($fl -join [char]10)); [IO.File]::WriteAllLines('%D_TMP%\fabric_files.txt', [string[]]@($files)); $cp=(Get-Content -Raw '%D_TMP%\classpath.txt').Trim(); $parts=@($cp -split ';'); $client=$parts[-1]; $rest=@(); if($parts.Count -gt 1){ $rest=$parts[0..($parts.Count-2)] }; $keep=@(); foreach($c in $rest){ $r2=($c -replace '^%D_LIB%\\','' -replace '\\','/'); $dup=$false; foreach($id in $ids){ if($r2.StartsWith($id+'/')){ $dup=$true; break } }; if(-not $dup){ $keep+=$c } }; $rest=$keep; [IO.File]::WriteAllText('%D_TMP%\classpath.txt', ((@($rest)+@($libs)+@($client)) -join ';')); [IO.File]::WriteAllText('%D_TMP%\fabric_ok.txt', $lv); Write-Host ('    已准备 Fabric ' + $lv + '，加载器库 ' + $files.Count + ' 个')"
+set "FAB_VER="
+if exist "%D_TMP%\fabric_ok.txt" set /p FAB_VER=<"%D_TMP%\fabric_ok.txt"
+if "!FAB_VER!"=="" (
+    if exist "%D_TMP%\fabric.txt" (
+        echo [警告] 连不上 Fabric 服务器，沿用上次的配置 ...
+        for /f "usebackq tokens=1,* delims==" %%a in ("%D_TMP%\fabric.txt") do if /i "%%a"=="LOADER" set "FAB_VER=%%b"
+    )
+)
+if "!FAB_VER!"=="" (
+    echo [错误] Fabric 加载器准备失败，请检查网络后重试。
+    exit /b 1
+)
+echo [OK] Fabric 加载器 !FAB_VER! 就绪，模组目录 %D_GAME%\mods
+exit /b 0
+
+
+:CHECK_JAVA_REQ
+set "REQ="if exist "%D_TMP%\javamaj.txt" set /p REQ=<"%D_TMP%\javamaj.txt"
+if "!REQ!"=="" set "REQ=21"
+if not defined JM set "JM=0"
+echo    该版本需要 Java !REQ! 及以上，当前 Java 为 !JM!
+set /a TEST_OK=0
+if !JM! GEQ !REQ! set /a TEST_OK=1
+if !TEST_OK! EQU 1 (
+    echo [OK] 当前 Java 版本满足要求。
+    exit /b 0
+)
+echo [注意] 当前 Java 版本偏低，安装 OpenJDK %JAVA_MAJOR% ...
+call :INSTALL_JDK %JAVA_MAJOR%
+if errorlevel 1 exit /b 1
+set "JAVA=%CD%\%D_JAVA%\bin\java.exe"
+call :JAVA_MAJOR "!JAVA!" JM
+echo [OK] 现在改用 OpenJDK !JM!
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  下载游戏核心文件
+REM ----------------------------------------------------------------------
+:DOWNLOAD_FILES
+set /a FAILED=0
+set /a TOTAL=0
+for /f "usebackq eol=# tokens=1-4 delims=|" %%a in ("%D_TMP%\files.txt") do (
+    set /a TOTAL+=1
+    set "DL_OUT=%%a"
+    set "DL_EXP=%%d"
+    set "DL_MIN=0"
+    set "DL_ZIP=0"
+    set "DL_URLS=%%b;%%c"
+    if "%USE_MIRROR%"=="0" set "DL_URLS=%%c"
+    call :DL
+    if errorlevel 1 (
+        echo    [警告] 下载失败 %%a
+        set /a FAILED+=1
+    )
+)
+if exist "%D_TMP%\fabric_files.txt" (
+    echo    正在下载 Fabric 加载器文件 ...
+    for /f "usebackq tokens=1-3 delims=|" %%a in ("%D_TMP%\fabric_files.txt") do (
+        set "DL_OUT=%%a"
+        set "DL_EXP=0"
+        set "DL_MIN=1000"
+        set "DL_ZIP=0"
+        set "DL_URLS=%%b;%%c"
+        call :DL
+        if errorlevel 1 (
+            echo    [警告] Fabric 库下载失败 %%a
+            set /a FAILED+=1
+        )
+    )
+)
+echo    核心文件共 !TOTAL! 个，失败 !FAILED! 个。
+if !FAILED! GTR 0 (
+    echo [错误] 部分核心文件下载失败，请检查网络后重新运行本脚本。
+    exit /b 1
+)
+exit /b 0
+
+
+:EXTRACT_NATIVES
+REM  老版本（1.18 及以前）的 DLL 需要从 natives 包里解压出来
+if not exist "%D_TMP%\natives.txt" exit /b 0
+for %%f in ("%D_TMP%\natives.txt") do if %%~zf LSS 10 exit /b 0
+echo    正在解压老版本的原生库 ...
+%PS% "Add-Type -AssemblyName System.IO.Compression.FileSystem; $lines=Get-Content '%D_TMP%\natives.txt'; foreach($l in $lines){ $p=($l -split '\|')[0]; if(Test-Path -LiteralPath $p){ try{ [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path -LiteralPath $p).Path,(Join-Path '%CD%' '%D_NAT%')) }catch{} } }" >nul 2>nul
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  下载游戏资源文件（贴图 / 音效 / 语言等）
+REM ----------------------------------------------------------------------
+:DOWNLOAD_ASSETS
+set /a PASS=0
+:ASSET_LOOP
+call :GEN_ASSETS
+if errorlevel 1 exit /b 1
+set "ACNT="
+if exist "%D_TMP%\assets_cnt.txt" set /p ACNT=<"%D_TMP%\assets_cnt.txt"
+if "!ACNT!"=="" set "ACNT=0"
+if "!ACNT!"=="0" (
+    echo [OK] 资源文件已完整。
+    exit /b 0
+)
+if !PASS! GEQ 2 (
+    echo [错误] 还有 !ACNT! 个资源文件下载失败。
+    exit /b 1
+)
+set /a PASS+=1
+if !PASS! EQU 1 (
+    echo    第 1 轮：国内镜像 BMCLAPI，待下载 !ACNT! 个文件
+    call :CURL_BATCH "%D_TMP%\assets_m.txt"
+) else (
+    echo    第 2 轮：Mojang 官方源，待下载 !ACNT! 个文件
+    call :CURL_BATCH "%D_TMP%\assets_o.txt"
+)
+goto :ASSET_LOOP
+
+
+:GEN_ASSETS
+%PS% "$v=Get-Content -Raw '%D_VER%\!VER!\!VER!.json' | ConvertFrom-Json; $a=Get-Content -Raw ('%D_AST%\indexes\'+$v.assetIndex.id+'.json') | ConvertFrom-Json; $m=@(); $o=@(); foreach($p in $a.objects.PSObject.Properties){ $ob=$p.Value; $h=$ob.hash; $r='%D_AST%\objects\'+$h.Substring(0,2)+'\'+$h; if(Test-Path -LiteralPath $r){ if((Get-Item -LiteralPath $r).Length -eq $ob.size){ continue } }; $rs=($r -replace '\\','/'); $m+=('https://bmclapi2.bangbang93.com/assets/'+$h.Substring(0,2)+'/'+$h+'|'+$r+'|'+$ob.size+'|'+$rs); $o+=('https://resources.download.minecraft.net/'+$h.Substring(0,2)+'/'+$h+'|'+$r+'|'+$ob.size+'|'+$rs) }; [IO.File]::WriteAllLines('%D_TMP%\assets_m.txt',[string[]]@($m)); [IO.File]::WriteAllLines('%D_TMP%\assets_o.txt',[string[]]@($o)); [IO.File]::WriteAllText('%D_TMP%\assets_cnt.txt',[string]$m.Count)" >nul 2>"%D_TMP%\gen.err"
+if not exist "%D_TMP%\assets_cnt.txt" (
+    echo [错误] 解析资源索引失败。
+    if exist "%D_TMP%\gen.err" type "%D_TMP%\gen.err"
+    exit /b 1
+)
+exit /b 0
+
+
+:CURL_BATCH
+REM  %1 = 待下载清单（格式：地址|路径|大小|正斜杠路径）
+set "CFG=%D_TMP%\dl.cfg"
+type nul > "!CFG!"
+set /a BLINES=0
+for /f "usebackq eol=# tokens=1-4 delims=|" %%a in ("%~1") do (
+    set /a BLINES+=1
+    >>"!CFG!" echo url = "%%a"
+    >>"!CFG!" echo output = "%%d"
+)
+if !BLINES! EQU 0 exit /b 0
+if not defined CURL_PAR (
+    echo    当前 curl 版本不支持并行下载，改为逐个下载，会比较慢 ...
+    for /f "usebackq eol=# tokens=1-4 delims=|" %%a in ("%~1") do (
+        set "DL_OUT=%%b"
+        set "DL_EXP=%%c"
+        set "DL_MIN=0"
+        set "DL_ZIP=0"
+        set "DL_URLS=%%a"
+        call :DL
+    )
+    exit /b 0
+)
+curl.exe --parallel --parallel-max 24 --fail --retry 2 --retry-delay 1 --connect-timeout 15 --create-dirs -L -s -S -K "!CFG!"
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  通用下载过程：镜像优先，失败自动换下一个地址
+REM  参数用全局变量传入：DL_OUT 目标文件 / DL_URLS 候选地址(分号分隔) / DL_EXP 期望大小
+REM  这里故意不用 call :DL 带参数，因为 call 会对参数做第二次解析，
+REM  会把地址里的 %2B 这类百分号编码吃掉，从而导致 404。
+REM ----------------------------------------------------------------------
+:DL
+if "!DL_EXP!"=="" set "DL_EXP=0"
+if "!DL_MIN!"=="" set "DL_MIN=0"
+if "!DL_ZIP!"=="" set "DL_ZIP=0"
+set /a DL_BIG=0
+if !DL_EXP! GEQ 5000000 set /a DL_BIG=1
+if !DL_MIN! GEQ 5000000 set /a DL_BIG=1
+set "DL_FSZ=0"
+if exist "!DL_OUT!" for %%f in ("!DL_OUT!") do set "DL_FSZ=%%~zf"
+set /a DL_OKF=0
+if !DL_EXP! GTR 0 if !DL_FSZ! EQU !DL_EXP! set /a DL_OKF=1
+if !DL_EXP! EQU 0 if !DL_FSZ! GEQ !DL_MIN! if !DL_FSZ! GTR 0 set /a DL_OKF=1
+if !DL_OKF! EQU 1 exit /b 0
+if exist "!DL_OUT!" del /f /q "!DL_OUT!" >nul 2>nul
+for %%f in ("!DL_OUT!") do if not exist "%%~dpf" md "%%~dpf" >nul 2>nul
+:DL_LOOP
+if "!DL_URLS!"=="" exit /b 1
+for /f "tokens=1,* delims=;" %%a in ("!DL_URLS!") do (
+    set "DL_URL=%%a"
+    set "DL_URLS=%%b"
+)
+if "!DL_URL!"=="" goto :DL_LOOP
+if !DL_BIG! EQU 1 echo    [下载] !DL_OUT!  来源 !DL_URL!
+curl.exe -L -# --fail --connect-timeout 20 --retry 2 --retry-delay 2 --speed-limit 1024 --speed-time 30 -o "!DL_OUT!" "!DL_URL!"
+set "DL_FSZ=0"
+if exist "!DL_OUT!" for %%f in ("!DL_OUT!") do set "DL_FSZ=%%~zf"
+set /a DL_OKF=0
+if !DL_EXP! GTR 0 if !DL_FSZ! EQU !DL_EXP! set /a DL_OKF=1
+if !DL_EXP! EQU 0 if !DL_FSZ! GEQ !DL_MIN! if !DL_FSZ! GTR 0 set /a DL_OKF=1
+if !DL_OKF! EQU 1 if "!DL_ZIP!"=="1" (
+    tar -tf "!DL_OUT!" >nul 2>&1
+    if errorlevel 1 set /a DL_OKF=0
+)
+if !DL_OKF! EQU 1 exit /b 0
+echo    [换源] 该地址不可用或文件不完整，换下一个 !DL_URL!
+if exist "!DL_OUT!" del /f /q "!DL_OUT!" >nul 2>nul
+goto :DL_LOOP
+
+
+REM ----------------------------------------------------------------------
+REM  正版微软账号登录（微软官方 device code 流程，不需要输入密码）
+REM  令牌缓存在 tmp\msa_profile.txt，刷新令牌在 tmp\msa_refresh.txt
+REM ----------------------------------------------------------------------
+:MSA_LOGIN
+del /q "%D_TMP%\msa_profile.txt" >nul 2>nul
+set "AUTH_NAME="
+set "AUTH_UUID="
+set "AUTH_TOKEN="
+set "AUTH_XUID="
+set "AUTH_TYPE=msa"
+%PS% "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $ErrorActionPreference='Stop'; $cid='00000000402b5328'; function P($u,$b){ Invoke-RestMethod -Method Post -Uri $u -Body $b }; $tok=$null; $rt=$null; if(Test-Path '%D_TMP%\msa_refresh.txt'){ try { $r=P 'https://login.live.com/oauth20_token.srf' @{client_id=$cid; grant_type='refresh_token'; refresh_token=(Get-Content '%D_TMP%\msa_refresh.txt' -Raw).Trim(); scope='XboxLive.signin offline_access'}; $tok=$r.access_token; $rt=$r.refresh_token; Write-Host '    发现上次的登录缓存，正在刷新令牌 ...' } catch { $tok=$null } }; if(-not $tok){ $dc=P 'https://login.live.com/oauth20_connect.srf' @{client_id=$cid; scope='XboxLive.signin offline_access'; response_type='device_code'}; Write-Host ''; Write-Host '  ------------------------------------------------------------'; Write-Host ('  1) 浏览器打开  ' + $dc.verification_uri); Write-Host ('  2) 输入代码    ' + $dc.user_code); Write-Host '  3) 用微软账号登录并点允许，然后回到这个窗口等结果'; Write-Host '  ------------------------------------------------------------'; Write-Host ''; $end=(Get-Date).AddSeconds([int]$dc.expires_in); $iv=[int]$dc.interval; while((Get-Date) -lt $end){ Write-Host -NoNewline '.'; Start-Sleep -Seconds $iv; try { $tk=P 'https://login.live.com/oauth20_token.srf' @{client_id=$cid; grant_type='urn:ietf:params:oauth:grant-type:device_code'; device_code=$dc.device_code}; $tok=$tk.access_token; $rt=$tk.refresh_token; break } catch { $em=[string]$_.ErrorDetails.Message; if($em -match 'authorization_declined'){ Write-Host '[错误] 你在网页上取消了授权。'; exit 1 }; if($em -match 'expired_token|bad_verification_code'){ Write-Host '[错误] 登录代码已过期，请重新运行。'; exit 1 } } } }; if(-not $tok){ Write-Host '[错误] 等待登录超时，请重新运行。'; exit 1 }; Write-Host '    微软账号登录成功，正在换取 Minecraft 令牌 ...'; $x=Invoke-RestMethod -Method Post -Uri 'https://user.auth.xboxlive.com/user/authenticate' -ContentType 'application/json' -Body (@{Properties=@{AuthMethod='RPS'; SiteName='user.auth.xboxlive.com'; RpsTicket=('d='+$tok)}; RelyingParty='http://auth.xboxlive.com'; TokenType='JWT'} | ConvertTo-Json -Compress); $uhs=$x.DisplayClaims.xui[0].uhs; try { $xs=Invoke-RestMethod -Method Post -Uri 'https://xsts.auth.xboxlive.com/xsts/authorize' -ContentType 'application/json' -Body (@{Properties=@{SandboxId='RETAIL'; UserTokens=@($x.Token)}; RelyingParty='rp://api.minecraftservices.com/'; TokenType='JWT'} | ConvertTo-Json -Compress) } catch { $e2=[string]$_.ErrorDetails.Message; if($e2 -match '2148916233'){ Write-Host '[错误] 这个微软账号还没有 Xbox 档案，请先用它登录一次 xbox.com 再试。' } elseif($e2 -match '2148916238'){ Write-Host '[错误] 未成年账号需要家长批准后才能登录。' } else { Write-Host ('[错误] Xbox 认证失败 ' + $e2) }; exit 2 }; try { $mc=Invoke-RestMethod -Method Post -Uri 'https://api.minecraftservices.com/authentication/login_with_xbox' -ContentType 'application/json' -Body (@{identityToken=('XBL3.0 x='+$uhs+';'+$xs.Token)} | ConvertTo-Json -Compress) } catch { Write-Host ('[错误] Minecraft 登录失败 ' + [string]$_.ErrorDetails.Message); exit 3 }; try { $pf=Invoke-RestMethod -Uri 'https://api.minecraftservices.com/minecraft/profile' -Headers @{Authorization=('Bearer '+$mc.access_token)} } catch { Write-Host '[错误] 这个账号没有购买 Minecraft Java 版，无法正版登录。'; exit 4 }; [IO.File]::WriteAllText('%D_TMP%\msa_profile.txt', ($pf.name + '|' + $pf.id + '|' + $mc.access_token + '|' + $uhs)); if($rt){ [IO.File]::WriteAllText('%D_TMP%\msa_refresh.txt', $rt) }; Write-Host '[OK] 正版账号验证完成'"
+if not exist "%D_TMP%\msa_profile.txt" (
+    echo [错误] 正版登录没有完成。想先玩离线模式，把配置区的 LOGIN 改回 offline。
+    exit /b 1
+)
+for /f "usebackq tokens=1-4 delims=|" %%a in ("%D_TMP%\msa_profile.txt") do (
+    set "AUTH_NAME=%%a"
+    set "AUTH_UUID=%%b"
+    set "AUTH_TOKEN=%%c"
+    set "AUTH_XUID=%%d"
+)
+if not defined AUTH_NAME (
+    echo [错误] 登录信息读取失败，请重新运行本脚本。
+    exit /b 1
+)
+echo [OK] 正版账号 !AUTH_NAME! 登录成功，令牌约 24 小时有效，下次自动刷新
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+REM  生成启动参数（离线 / 正版通用）
+REM ----------------------------------------------------------------------
+:MAKE_ARGS
+echo    正在生成启动参数 ...
+set "FABON="
+if /i "%MOD_LOADER%"=="fabric" set "FABON=1"
+if not defined AUTH_TYPE set "AUTH_TYPE=legacy"
+if /i "!AUTH_TYPE!"=="legacy" (
+    set "AUTH_NAME=%PLAYER_NAME%"
+    set "AUTH_UUID="
+    set "AUTH_TOKEN=0"
+    set "AUTH_XUID="
+)
+%PS% "$j=Get-Content -Raw '%D_VER%\!VER!\!VER!.json' | ConvertFrom-Json; function OK($r){ if(-not $r){return $true}; $res=$false; foreach($x in $r){ $mt=$true; if($x.os){ if($x.os.name -and $x.os.name -ne 'windows'){$mt=$false}; if($x.os.arch -and $x.os.arch -notin @('x64','amd64')){$mt=$false} }; if($x.features){ foreach($p in $x.features.PSObject.Properties){ if($p.Value){$mt=$false} } }; if($mt){ if($x.action -eq 'allow'){$res=$true} else {$res=$false} } }; $res }; function RES($v){ $o=@(); if(-not $v){ return ,$o }; foreach($x in $v){ if($x -is [string]){ $o+=$x } else { if(OK $x.rules){ $y=$x.value; if($y -is [array]){ foreach($z in $y){ $o+=$z } } else { $o+=$y } } } }; return ,$o }; function Q($s){ if($s -eq ''){ return [char]34+[char]34 }; if($s -match '\s'){ return [char]34+($s -replace '\\','\\')+[char]34 }; return $s }; $cp=(Get-Content -Raw '%D_TMP%\classpath.txt').Trim(); $name='%AUTH_NAME%'; $uuid='%AUTH_UUID%'; $tok='%AUTH_TOKEN%'; $ut='%AUTH_TYPE%'; $xu='%AUTH_XUID%'; $cidg=[guid]::NewGuid().ToString(); if($uuid -eq ''){ $h=[System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes('OfflinePlayer:'+$name)); $h[6]=($h[6] -band 0x0F) -bor 0x30; $h[8]=($h[8] -band 0x3F) -bor 0x80; $hs=-join ($h | ForEach-Object { $_.ToString('x2') }); $uuid=$hs.Substring(0,8)+'-'+$hs.Substring(8,4)+'-'+$hs.Substring(12,4)+'-'+$hs.Substring(16,4)+'-'+$hs.Substring(20) } $map=@{}; $map['${auth_player_name}']=$name; $map['${version_name}']=$j.id; $map['${game_directory}']='%D_GAME%'; $map['${assets_root}']='%D_AST%'; $map['${assets_index_name}']=$j.assetIndex.id; $map['${auth_uuid}']=$uuid; $map['${auth_access_token}']=$tok; $map['${user_type}']=$ut; $map['${version_type}']=[string]$j.type; $map['${classpath}']=$cp; $map['${natives_directory}']='%D_NAT%'; $map['${launcher_name}']='cmd-mc-launcher'; $map['${launcher_version}']='1.0'; $map['${clientid}']=$cidg; $map['${auth_xuid}']=$xu; $map['${user_properties}']='{}'; $map['${game_assets}']='%D_AST%\virtual\legacy'; function S2($a){ $s=[string]$a; foreach($k in @($map.Keys)){ $s=$s.Replace($k,$map[$k]) }; $s }; $jj=@('-Xms512M','-Xmx%MEMORY%','-Dfile.encoding=UTF-8','-Dstdout.encoding=UTF-8','-Dstderr.encoding=UTF-8'); foreach($a in (RES $j.arguments.jvm)){ $jj+=(S2 $a) }; if(-not ($jj -match '^-Djava\.library\.path')){ $jj+=('-Djava.library.path='+'%D_NAT%') }; $hk=$false; foreach($a in $jj){ if($a -eq '-cp' -or $a -eq '--class-path' -or $a -eq '-classpath'){ $hk=$true } }; if(-not $hk){ $jj+=@('-cp',$cp) }; $fmain=$null; $fjvm=@(); if('%FABON%' -eq '1' -and (Test-Path '%D_TMP%\fabric.txt')){ foreach($ln in (Get-Content '%D_TMP%\fabric.txt')){ if($ln.StartsWith('MAINCLASS=')){ $fmain=$ln.Substring(10) } elseif($ln.StartsWith('JVMA=')){ $fjvm+=($ln.Substring(5)) } }; foreach($fa in $fjvm){ $jj+=$fa } }; if($j.logging.client){ $jj+=($j.logging.client.argument.Replace('${path}',('%D_VER%\'+$j.id+'\'+$j.logging.client.file.id))) }; $gj=@(); if($j.arguments.game){ foreach($a in (RES $j.arguments.game)){ $gj+=(S2 $a) } } elseif($j.minecraftArguments){ foreach($a in ($j.minecraftArguments -split ' ')){ $gj+=(S2 $a) } }; $out=@(); foreach($a in $jj){ $out+=(Q $a) }; if($fmain){ $out+=(Q $fmain) } else { $out+=(Q ([string]$j.mainClass)) }; foreach($a in $gj){ $out+=(Q $a) }; [IO.File]::WriteAllLines('%D_TMP%\args.txt',[string[]]$out)" >nul 2>"%D_TMP%\args.err"
+if not exist "%D_TMP%\args.txt" (
+    echo [错误] 生成启动参数失败。
+    if exist "%D_TMP%\args.err" type "%D_TMP%\args.err"
+    exit /b 1
+)
+echo [OK] 启动参数已写入 %D_TMP%\args.txt
+exit /b 0
+
+
+REM ----------------------------------------------------------------------
+:FATAL
+echo.
+echo ======================================================================
+echo  运行失败，请根据上面的提示处理。常见原因：网络不通、版本号写错。
+echo ======================================================================
+popd
+pause
+exit /b 1
